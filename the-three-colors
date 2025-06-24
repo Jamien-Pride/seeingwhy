@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>The Three Colors</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #FFFEFA;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        #canvas-container {
+            width: 750px;
+            height: 750px;
+            background-color: #FFFEFA;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <canvas id="threeColorsCanvas"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('threeColorsCanvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = 750;
+        canvas.height = 750;
+        
+        // Start with a clean canvas
+        ctx.fillStyle = '#FFFEFA';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        let time = 0;
+        let animationFrameId = null;
+        const lineCount = 20;
+        const lineSpacing = canvas.height / (lineCount + 1);
+        const verticalLineCount = 20;
+        const verticalLineSpacing = canvas.width / (verticalLineCount + 1);
+        
+        // Three patterns representing simplicity, patience, and humility
+        const dotPatterns = [];
+        for (let i = 0; i < 3; i++) {
+            const pattern = [];
+            const frequency = 0.5 + i * 0.3;  // Each virtue moves at its own pace
+            const amplitude = (100 + i * 50) / 2;    // Half the original amplitude
+            
+            for (let j = 0; j < 15; j++) {
+                pattern.push({
+                    baseX: 375, // Center of canvas
+                    baseY: 237.5 + (j + 1) * (275 / 16), // Properly centered in half-size area
+                    frequency: frequency,
+                    amplitude: amplitude,
+                    phase: j * 0.2
+                });
+            }
+            dotPatterns.push(pattern);
+        }
+        
+        const animate = () => {
+            // Create trails by using semi-transparent fill instead of complete clear
+            ctx.fillStyle = 'rgba(255, 254, 250, 0.02)'; // Much lower opacity for longer trails
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            time += 0.0045; // Further reduced to 56.25% of original speed
+            
+            // Set blend mode for color mixing
+            ctx.globalCompositeOperation = 'multiply';
+            
+            // Draw dot patterns with CMY colors
+            dotPatterns.forEach((pattern, patternIndex) => {
+                pattern.forEach(dot => {
+                    const x = dot.baseX + Math.sin(time * dot.frequency + dot.phase) * dot.amplitude;
+                    const y = dot.baseY;
+                    
+                    const sizeMultiplier = 1 + Math.sin(time * 1.5 + patternIndex + dot.phase) * 0.3; // Reduced to 75% pulse speed
+                    const size = 2 * sizeMultiplier; // Smaller dots to match the scale
+                    
+                    // CMY colors for each pattern with reduced opacity for subtlety
+                    const colors = [
+                        'rgba(0, 255, 255, 0.4)', // Cyan
+                        'rgba(255, 0, 255, 0.4)', // Magenta
+                        'rgba(255, 255, 0, 0.4)'  // Yellow
+                    ];
+                    
+                    const opacity = 0.4 + Math.sin(time * 1.125 + dot.phase) * 0.15; // More subtle opacity changes
+                    ctx.fillStyle = colors[patternIndex].replace('0.4', opacity);
+                    ctx.beginPath();
+                    ctx.arc(x, y, size, 0, Math.PI * 2);
+                    ctx.fill();
+                });
+            });
+            
+            // Reset blend mode
+            ctx.globalCompositeOperation = 'source-over';
+            
+            animationFrameId = requestAnimationFrame(animate);
+        };
+        
+        // Start animation
+        animate();
+        
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+            }
+        });
+    </script>
+</body>
+</html>
