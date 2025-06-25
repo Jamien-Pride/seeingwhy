@@ -15,8 +15,8 @@
             min-height: 100vh;
         }
         #canvas-container {
-            width: 750px;
-            height: 750px;
+            width: 350px;
+            height: 325px;
             background-color: #FFFEFA;
         }
         canvas {
@@ -32,8 +32,8 @@
     <script>
         const canvas = document.getElementById('threeColorsCanvas');
         const ctx = canvas.getContext('2d');
-        canvas.width = 750;
-        canvas.height = 750;
+        canvas.width = 350;
+        canvas.height = 325;
         
         // Start with a clean canvas
         ctx.fillStyle = '#FFFEFA';
@@ -41,10 +41,6 @@
         
         let time = 0;
         let animationFrameId = null;
-        const lineCount = 20;
-        const lineSpacing = canvas.height / (lineCount + 1);
-        const verticalLineCount = 20;
-        const verticalLineSpacing = canvas.width / (verticalLineCount + 1);
         
         // Three patterns representing simplicity, patience, and humility
         const dotPatterns = [];
@@ -55,8 +51,8 @@
             
             for (let j = 0; j < 15; j++) {
                 pattern.push({
-                    baseX: 375, // Center of canvas
-                    baseY: 237.5 + (j + 1) * (275 / 16), // Properly centered in half-size area
+                    baseX: 175, // Original position minus the cropped left side
+                    baseY: 12.5 + (j + 1) * (275 / 16), // Original spacing and size
                     frequency: frequency,
                     amplitude: amplitude,
                     phase: j * 0.2
