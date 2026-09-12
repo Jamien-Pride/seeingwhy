@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Glass Birds - Seeing Why</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <style>
+        html {
+            background: #FFFEFA;
+        }
+
+        body {
+            margin: 0;
+            overflow-x: hidden;
+            overflow-y: auto;
+            background-color: #FFFEFA;
+            color: #333;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            min-height: 100vh;
+        }
+
+        /* Birds container as fixed background */
+        #birds-background {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+            background: #FFFEFA;
+        }
+
+        #birds-background canvas {
+            display: block;
+        }
+
+        /* Content overlay */
+        #content-wrapper {
+            position: relative;
+            z-index: 10;
+            min-height: 100vh;
+            pointer-events: none; /* Allow mouse to reach birds */
+        }
+
+        /* Make interactive elements clickable */
+        #content-wrapper * {
+            pointer-events: auto;
+        }
+    </style>
+</head>
+<body>
+    <!-- Birds background container -->
+    <div id="birds-background"></div>
+
+    <!-- Your content goes here -->
+    <div id="content-wrapper">
+        <!-- Your Wix content will overlay here -->
+    </div>
+
+    <!--
+        ============================================================
+        CMY FLOCK  -  glass edition
+        ============================================================
+        Three colours of bird (cyan, magenta, yellow) flock on a
+        near-white ground with multiply blending, so wherever the
+        colours overlap they mix like stacked glass filters.
+
+        The birds are rendered as faceted coloured glass on a light
+        table: light passes through each facet and is absorbed in
+        proportion to how much glass it crosses (Beer-Lambert), so a
+        wing is pale where it is thin and face-on, and saturated where
+        it is thick or seen edge-on. Facets are tilted slightly against
+        each other, so they catch glints from a key light as the wings
+        beat, and each facet has a bevelled edge that picks up light.
+
+        The flock is simulated entirely on the GPU. Two small float
+        textures hold the state of every bird:
+
+            texturePosition : xyz = position,  w = wing-beat phase
+            textureVelocity : xyz = velocity,  w = bank (roll) angle
+
+        Each frame the velocity shader runs one fragment per bird and
+        looks at every other bird (brute force, which is fine for a
+        few thousand). The behaviour is a Reynolds-style steering
+        model:
+
+          * separation  - keep clear of very close neighbours
+          * alignment   - match the heading of visible neighbours
+          * cohesion    - drift toward the centre of visible neighbours
+          * field of view - birds only react to what they can see;
+                            nothing behind them counts
+          * colour affinity - a bird weights neighbours of its own
+                            colour more, so bands of colour form and
+                            dissolve; the strength "breathes" slowly
+          * home        - a soft, screen-sized ellipsoid that keeps the
+                          flock in frame, its centre drifting slowly
+          * predator    - the pointer; birds flee it, a click or tap
+                          scatters them
+          * wander      - a little per-bird noise so nothing settles
+
+        Every steering force is capped (maxForce) so turns are smooth,
+        speed is held between a minimum and a maximum so birds never
+        stall or snap, and the lateral acceleration of each bird is
+        turned into a banking angle so they roll into their turns.
+
+        Each bird is a small articulated model: a spindle body with a
+        thin keel, a forked tail and two-segment wings that beat at the
+        shoulder and wrist, with the glass thinning toward the tips.
+
+        Tuning: edit CONFIG below, or override a few things from the
+        URL, e.g.  birds-glass.html?birds=64&speed=0.8&affinity=0.6
+        ============================================================
+    -->
+
+    <!-- Position / phase update -->
+    <script id="fragmentShaderPosition" type="x-shader/x-fragment">
+        const float TWO_PI = 6.283185307179586;
+
+        void main() {
+            vec2 uv = gl_FragCoord.xy / resolution.xy;
+            vec4 p = texture2D( texturePosition, uv );
+            vec3 velocity = texture2D( textureVelocity, uv ).xyz;
+
+            float speed = length( velocity );
+            float climb = max( velocity.y, 0.0 );
+
+            // Wing-beat rate: a base rate, faster with airspeed, faster
+            // still when climbing. When diving the bird tucks into a glide
+            // and the beat slows right down.
+            float glide = smoothstep( -40.0, 0.0, velocity.y );
+            float rate = flapBase + speed * flapPerSpeed + climb * flapPerClimb;
+            rate *= mix( 0.3, 1.0, glide );
+
+            float phase = mod( p.w + rate * delta, TWO_PI );
+
+            gl_FragColor = vec4( p.xyz + velocity * delta, phase );
+        }
+    </script>
+
+    <!-- Velocity / bank update: the flocking model lives here -->
+    <script id="fragmentShaderVelocity" type="x-shader/x-fragment">
+        const float TWO_PI = 6.283185307179586;
+
+        float hash( vec2 p ) {
+            return fract( sin( dot( p, vec2( 12.9898, 78.233 ) ) ) * 43758.5453 );
+        }
+
+        // Colour group of the bird stored at texel (ix, iy). Mirrors the
+        // JS colour assignment: birdIndex % 3.
+        float groupOf( float ix, float iy ) {
+            return mod( iy * WIDTH + ix, 3.0 );
+        }
+
+        // Reynolds steering: the force that would turn our velocity toward
+        // "desiredDir" at cruise speed, capped at maxForce so turns stay
+        // smooth instead of snapping.
+        vec3 steer( vec3 desiredDir, vec3 velocity ) {
+            float len = length( desiredDir );
+            if ( len < 1e-5 ) return vec3( 0.0 );
+            vec3 force = desiredDir / len * cruiseSpeed - velocity;
+            float fl = length( force );
+            if ( fl > maxForce ) force *= maxForce / fl;
+            return force;
+        }
+
+        void main() {
+            vec2 uv = gl_FragCoord.xy / resolution.xy;
+            vec2 self = floor( gl_FragCoord.xy );
+
+            vec3 pos = texture2D( texturePosition, uv ).xyz;
+            vec4 velData = texture2D( textureVelocity, uv );
+            vec3 vel = velData.xyz;
+            float bank = velData.w;
+
+            float speed = length( vel );
+            vec3 heading = speed > 1e-4 ? vel / speed : vec3( 0.0, 0.0, 1.0 );
+            float myGroup = groupOf( self.x, self.y );
+
+            vec3 sep = vec3( 0.0 );
+            vec3 ali = vec3( 0.0 );
+            vec3 coh = vec3( 0.0 );
+            float aliW = 0.0;
+            float cohW = 0.0;
+
+            for ( float y = 0.0; y < WIDTH; y += 1.0 ) {
+                for ( float x = 0.0; x < WIDTH; x += 1.0 ) {
+
+                    vec2 ref = ( vec2( x, y ) + 0.5 ) / resolution.xy;
+                    vec3 other = texture2D( texturePosition, ref ).xyz;
+
+                    vec3 d = other - pos;
+                    float dist = length( d );
+
+                    // Skip ourselves and anything out of range.
+                    if ( dist < 0.01 || dist > cohesionDistance ) continue;
+
+                    vec3 dn = d / dist;
+
+                    // Separation works all round: you can still collide
+                    // with a bird you cannot see.
+                    if ( dist < separationDistance ) {
+                        float s = 1.0 - dist / separationDistance;
+                        sep -= dn * s * s;
+                    }
+
+                    // Field of view: birds behind us are invisible.
+                    if ( dot( dn, heading ) < fovCos ) continue;
+
+                    // Same-colour neighbours count fully, other colours
+                    // are discounted by the current affinity.
+                    float w = ( groupOf( x, y ) == myGroup ) ? 1.0 : 1.0 - colorAffinity;
+
+                    // Nearer neighbours matter more (roughly what real
+                    // starlings do: they track their few closest birds).
+                    float falloff = 1.0 - smoothstep( 0.0, cohesionDistance, dist );
+                    float wf = w * falloff;
+
+                    if ( dist < alignmentDistance ) {
+                        vec3 ov = texture2D( textureVelocity, ref ).xyz;
+                        float ol = length( ov );
+                        if ( ol > 1e-4 ) {
+                            ali += ov / ol * wf;
+                            aliW += wf;
+                        }
+                    }
+
+                    coh += d * wf;
+                    cohW += wf;
+                }
+            }
+
+            vec3 acc = vec3( 0.0 );
+
+            acc += steer( sep, vel ) * separationWeight;
+            if ( aliW > 0.0 ) acc += steer( ali, vel ) * alignmentWeight;
+            if ( cohW > 0.0 ) acc += steer( coh / cohW, vel ) * cohesionWeight;
+
+            // Home: a soft ellipsoid the size of the screen. Inside it the
+            // pull is tiny; outside it grows quadratically.
+            vec3 rel = pos - homeCenter;
+            float relLen = length( rel );
+            vec3 relN = relLen > 1e-4 ? rel / relLen : vec3( 0.0 );
+            float e = length( rel / homeRadius );
+            float over = max( e - 1.0, 0.0 );
+            float homeF = homePull + homeStrength * over * over;
+            acc -= relN * maxForce * min( homeF, 3.0 );
+
+            // Predator (the pointer). Distance is measured mostly across the
+            // screen so the whole depth of the flock reacts.
+            vec3 pd = pos - predator;
+            pd -= viewDir * dot( pd, viewDir ) * 0.65;
+            float pdist = length( pd );
+            float scare = 0.0;
+            if ( predatorStrength > 0.001 && pdist < predatorRadius ) {
+                scare = 1.0 - pdist / predatorRadius;
+                scare = scare * scare * predatorStrength;
+                acc += ( pd / max( pdist, 0.01 ) ) * maxForce * scare * predatorForce;
+            }
+
+            // Wander: smooth, per-bird, so the flock never freezes into a
+            // perfect lattice.
+            float p1 = hash( self ) * TWO_PI;
+            float p2 = hash( self + 1.7 ) * TWO_PI;
+            float p3 = hash( self + 3.1 ) * TWO_PI;
+            vec3 wander = vec3(
+                sin( time * 0.9 + p1 ),
+                sin( time * 1.1 + p2 ) * 0.5,
+                sin( time * 0.7 + p3 )
+            );
+            acc += wander * maxForce * wanderStrength;
+
+            // Integrate and keep the airspeed sane. A frightened bird is
+            // allowed to go faster than a cruising one.
+            vec3 newVel = vel + acc * delta;
+            float ns = length( newVel );
+            float vmax = maxSpeed * ( 1.0 + 0.5 * min( scare, 1.0 ) );
+            if ( ns < 1e-4 ) {
+                newVel = heading * minSpeed;
+                ns = minSpeed;
+            } else {
+                newVel *= clamp( ns, minSpeed, vmax ) / ns;
+            }
+
+            // Bank: roll into the turn in proportion to lateral
+            // acceleration, smoothed so it reads as a real roll.
+            vec3 h1 = newVel / max( length( newVel ), 1e-4 );
+            vec3 right = cross( h1, vec3( 0.0, 1.0, 0.0 ) );
+            float rl = length( right );
+            right = rl > 1e-3 ? right / rl : vec3( 1.0, 0.0, 0.0 );
+            float lateral = dot( ( newVel - vel ) / max( delta, 1e-4 ), right );
+            float targetBank = clamp( -lateral * bankGain, -maxBank, maxBank );
+            bank = mix( bank, targetBank, 1.0 - exp( -delta * bankRate ) );
+
+            gl_FragColor = vec4( newVel, bank );
+        }
+    </script>
+
+    <!-- Bird rendering -->
+    <script type="x-shader/x-vertex" id="birdVS">
+        attribute vec2 reference;
+        attribute float joint;       // 0 body/tail, 1 inner wing, 2 outer wing
+        attribute float inkWeight;   // glass thickness, thinning toward the tips
+        attribute float birdSize;    // per-bird size multiplier
+        attribute vec3 birdColor;
+        attribute vec3 birdNormal;   // facet normal in the bird's local frame
+        attribute vec3 bary;         // barycentric corner, for bevelled facet edges
+
+        uniform sampler2D texturePosition;
+        uniform sampler2D textureVelocity;
+        uniform float birdScale;
+
+        varying vec3 vColor;
+        varying float vDepth;
+        varying float vInk;
+        varying vec3 vNormal;
+        varying vec3 vWorldPos;
+        varying vec3 vBary;
+
+        // Wing joints in local (unscaled) bird units.
+        const float SHOULDER = 2.6;
+        const float WRIST = 12.0;
+
+        vec2 rotateAbout( vec2 p, float pivotX, float a ) {
+            vec2 q = p - vec2( pivotX, 0.0 );
+            float c = cos( a );
+            float s = sin( a );
+            return vec2( q.x * c - q.y * s, q.x * s + q.y * c ) + vec2( pivotX, 0.0 );
+        }
+
+        vec2 rotate( vec2 p, float a ) {
+            float c = cos( a );
+            float s = sin( a );
+            return vec2( p.x * c - p.y * s, p.x * s + p.y * c );
+        }
+
+        void main() {
+            vec4 p = texture2D( texturePosition, reference );
+            vec4 v = texture2D( textureVelocity, reference );
+
+            vec3 vel = v.xyz;
+            float bank = v.w;
+
+            // Orthonormal frame: forward along the velocity, right and up
+            // from the world up vector, then rolled by the bank angle.
+            float s = length( vel );
+            vec3 forward = s > 1e-4 ? vel / s : vec3( 0.0, 0.0, 1.0 );
+            vec3 right = cross( forward, vec3( 0.0, 1.0, 0.0 ) );
+            float rl = length( right );
+            right = rl > 1e-3 ? right / rl : vec3( 1.0, 0.0, 0.0 );
+            vec3 up = cross( right, forward );
+
+            float cb = cos( bank );
+            float sb = sin( bank );
+            vec3 rB = right * cb + up * sb;
+            vec3 uB = up * cb - right * sb;
+
+            // Wing beat. The stroke is asymmetric (a quick downstroke, a
+            // slower recovery), the outer wing lags the inner wing and
+            // folds back a little on the way up, and a diving bird
+            // settles into a glide with its wings held in a shallow V.
+            float glide = smoothstep( -40.0, 0.0, vel.y );
+            float beat = mix( 0.2, 1.0, glide );
+            float phi = p.w;
+            phi += 0.35 * sin( phi );
+            float shoulder = 0.12 + 0.55 * beat * cos( phi );
+            float wrist = 0.7 * beat * cos( phi - 0.8 ) - 0.08;
+
+            vec3 local = position;
+            vec3 n = birdNormal;
+            if ( joint > 0.5 ) {
+                float side = local.x < 0.0 ? -1.0 : 1.0;
+                if ( joint > 1.5 ) {
+                    local.xy = rotateAbout( local.xy, WRIST * side, wrist * side );
+                    n.xy = rotate( n.xy, wrist * side );
+                    local.z -= 3.5 * max( 0.0, -cos( phi ) ) * beat;
+                }
+                local.xy = rotateAbout( local.xy, SHOULDER * side, shoulder * side );
+                n.xy = rotate( n.xy, shoulder * side );
+            }
+            local *= birdScale * birdSize;
+
+            mat3 frame = mat3( rB, uB, forward );
+            vec3 world = frame * local + p.xyz;
+            vec4 mv = viewMatrix * vec4( world, 1.0 );
+
+            vDepth = -mv.z;
+            vColor = birdColor;
+            vInk = inkWeight;
+            vNormal = frame * n;
+            vWorldPos = world;
+            vBary = bary;
+            gl_Position = projectionMatrix * mv;
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="birdFS">
+        varying vec3 vColor;
+        varying float vDepth;
+        varying float vInk;
+        varying vec3 vNormal;
+        varying vec3 vWorldPos;
+        varying vec3 vBary;
+
+        uniform float density;
+        uniform float rimWidth;
+        uniform float rimStrength;
+        uniform float glintStrength;
+        uniform float fresnelStrength;
+        uniform vec3 lightDir;
+        uniform float fogNear;
+        uniform float fogFar;
+        uniform float fogAmount;
+
+        void main() {
+            vec3 N = normalize( vNormal );
+            vec3 V = normalize( cameraPosition - vWorldPos );
+            float ndv = dot( N, V );
+            if ( ndv < 0.0 ) { N = -N; ndv = -ndv; }
+
+            // Light crosses more glass at grazing angles and where the
+            // sheet is thick. Coloured glass absorbs the complement of its
+            // colour, so cyan glass eats red, and so on.
+            float thickness = vInk / max( ndv, 0.1 );
+            vec3 absorb = ( 1.0 - vColor ) * density;
+            vec3 transmitted = exp( -absorb * thickness );
+
+            // At grazing angles the surface reflects the bright room.
+            float fresnel = pow( 1.0 - ndv, 4.0 ) * fresnelStrength;
+
+            // A key light: a sharp glint and a broad soft sheen.
+            vec3 L = normalize( lightDir );
+            vec3 H = normalize( L + V );
+            float ndh = max( dot( N, H ), 0.0 );
+            float glint = ( pow( ndh, 70.0 ) + 0.25 * pow( ndh, 8.0 ) ) * glintStrength;
+
+            // Bevelled facet edges catch light.
+            float edgeDist = min( vBary.x, min( vBary.y, vBary.z ) );
+            float bevel = ( 1.0 - smoothstep( 0.0, rimWidth, edgeDist ) ) * rimStrength;
+
+            // Under multiply blending white is transparent, so every
+            // reflection reads as light passing straight through.
+            float bright = clamp( fresnel + glint + bevel, 0.0, 1.0 );
+            vec3 c = mix( transmitted, vec3( 1.0 ), bright );
+
+            float fade = smoothstep( fogNear, fogFar, vDepth ) * fogAmount;
+            c = mix( c, vec3( 1.0 ), fade );
+
+            gl_FragColor = vec4( c, 1.0 );
+        }
+    </script>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+    (function () {
+        if (typeof THREE === 'undefined') return;
+
+        // ------------------------------------------------------------
+        // Configuration
+        // ------------------------------------------------------------
+        const params = new URLSearchParams(window.location.search);
+        const num = (key, fallback) => {
+            const v = parseFloat(params.get(key));
+            return Number.isFinite(v) ? v : fallback;
+        };
+
+        const isMobile = window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 700;
+        const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+        const CONFIG = {
+            // Flock size is textureWidth squared (40 -> 1600 birds).
+            // The neighbour search is O(n^2), so keep it modest on phones.
+            textureWidth: Math.round(Math.min(96, Math.max(8, num('birds', isMobile ? 32 : 40)))),
+            birdScale: 0.28,           // world units per local bird unit (wingspan 50 local); glass reads better a little larger
+            sizeVariation: 0.18,       // +/- fraction of size between individual birds
+
+            // Airspeed (world units per second) and steering authority.
+            cruiseSpeed: 95,
+            minSpeed: 45,
+            maxSpeed: 160,
+            maxForce: 280,
+
+            // Neighbourhood (world units) and rule weights.
+            separationDistance: 20,
+            alignmentDistance: 50,
+            cohesionDistance: 80,
+            separationWeight: 2.0,
+            alignmentWeight: 1.2,
+            cohesionWeight: 0.55,
+            fieldOfView: 250,          // degrees; birds see almost all round
+
+            // Colour banding: 0 = colours ignore each other, 1 = each
+            // colour flocks only with itself. The value breathes between
+            // base - breath and base + breath over one period (seconds).
+            colorAffinity: num('affinity', 0.4),
+            affinityBreath: 0.3,
+            affinityPeriod: 140,
+
+            // Home ellipsoid: sized from the visible frame, drifting slowly.
+            homeMargin: 0.6,          // fraction of the visible half-width/height
+            homeDepth: 120,            // half-depth in world units
+            homeStrength: 3.0,
+            homePull: 0.04,
+            homeDrift: 0.25,           // fraction of the radius the centre wanders
+
+            // Pointer as predator.
+            predatorRadius: 150,
+            predatorForce: 3.0,
+            predatorLinger: 1.2,       // seconds after the pointer stops
+            burstStrength: 2.5,        // click / tap scatter
+
+            wanderStrength: 0.2,
+
+            // Wing beat (radians per second) and banking.
+            flapBase: 4.0,
+            flapPerSpeed: 0.16,
+            flapPerClimb: 0.18,
+            bankGain: 0.0065,
+            maxBank: 1.15,
+            bankRate: 5.0,
+
+            // Look: coloured glass on a light table.
+            glassDensity: 1.4,         // absorption per unit thickness
+            facetTilt: 0.22,           // how far facets tilt against each other
+            rimWidth: 0.14,            // bevel width as a fraction of a facet
+            rimStrength: 0.4,
+            glintStrength: 0.9,
+            fresnelStrength: 0.7,
+            lightDir: [-0.45, 0.8, 0.5],
+            fogNear: 260,
+            fogFar: 950,
+            fogAmount: 0.55,
+            cameraDistance: 350,
+            cameraFov: 75,
+            cameraElevation: 18,       // degrees above the flock, so wings read from above
+            cameraDrift: reduceMotion ? 0 : 16,
+
+            timeScale: num('speed', 1) * (reduceMotion ? 0.5 : 1),
+            maxPixelRatio: 2
+        };
+
+        const WIDTH = CONFIG.textureWidth;
+        const BIRDS = WIDTH * WIDTH;
+
+        // ------------------------------------------------------------
+        // Bird geometry. Local frame: +x right wing, +y up, +z forward.
+        // A flat spindle body with a thin vertical keel so it reads from
+        // every angle, a forked tail, and two-segment wings (arm and hand)
+        // that the vertex shader articulates at the shoulder and wrist.
+        // Pieces meet edge to edge rather than overlapping, so multiply
+        // blending does not double up inside one bird.
+        // ------------------------------------------------------------
+        class BirdGeometry extends THREE.BufferGeometry {
+            constructor() {
+                super();
+
+                // Named points: [x, y, z, joint, ink]
+                const P = {
+                    nose:   [0, 0, 28, 0, 1.0],
+                    core:   [0, 0, 6, 0, 1.0],
+                    tailRt: [0, 0, -12, 0, 0.9],
+                    L1: [-2.2, 0, 16, 0, 1.0],  R1: [2.2, 0, 16, 0, 1.0],
+                    L2: [-3.2, 0, 4, 0, 1.0],   R2: [3.2, 0, 4, 0, 1.0],
+                    L3: [-2.0, 0, -8, 0, 0.95], R3: [2.0, 0, -8, 0, 0.95],
+                    keelTop: [0, 2.4, 8, 0, 1.0],
+                    keelBot: [0, -1.6, 5, 0, 1.0],
+                    tailL:  [-4.5, 0, -24, 0, 0.55],
+                    tailR:  [4.5, 0, -24, 0, 0.55],
+                    notch:  [0, 0, -19, 0, 0.8],
+                    // left wing
+                    lRL: [-2.6, 0, 10, 1, 1.0],  lRT: [-2.6, 0, -4, 1, 1.0],
+                    lWL: [-12, 0, 9, 1, 0.85],   lWT: [-12, 0, -2, 1, 0.85],
+                    lTL: [-21, 0, 3, 2, 0.6],    lTip: [-25, 0, -7, 2, 0.4],
+                    // right wing
+                    rRL: [2.6, 0, 10, 1, 1.0],   rRT: [2.6, 0, -4, 1, 1.0],
+                    rWL: [12, 0, 9, 1, 0.85],    rWT: [12, 0, -2, 1, 0.85],
+                    rTL: [21, 0, 3, 2, 0.6],     rTip: [25, 0, -7, 2, 0.4]
+                };
+
+                const tris = [
+                    // body fan
+                    ['nose', 'L1', 'core'], ['L1', 'L2', 'core'], ['L2', 'L3', 'core'], ['L3', 'tailRt', 'core'],
+                    ['nose', 'core', 'R1'], ['R1', 'core', 'R2'], ['R2', 'core', 'R3'], ['R3', 'core', 'tailRt'],
+                    // keel
+                    ['nose', 'keelTop', 'tailRt'], ['nose', 'tailRt', 'keelBot'],
+                    // forked tail
+                    ['tailRt', 'tailL', 'notch'], ['tailRt', 'notch', 'tailR'],
+                    // left wing: arm then hand
+                    ['lRL', 'lWL', 'lRT'], ['lWL', 'lWT', 'lRT'],
+                    ['lWL', 'lTL', 'lWT'], ['lTL', 'lTip', 'lWT'],
+                    // right wing
+                    ['rRL', 'rRT', 'rWL'], ['rWL', 'rRT', 'rWT'],
+                    ['rWL', 'rWT', 'rTL'], ['rTL', 'rWT', 'rTip']
+                ];
+
+                const vertsPerBird = tris.length * 3;
+                const points = BIRDS * vertsPerBird;
+
+                const vertices = new Float32Array(points * 3);
+                const colors = new Float32Array(points * 3);
+                const references = new Float32Array(points * 2);
+                const joint = new Float32Array(points);
+                const inkWeight = new Float32Array(points);
+                const birdSize = new Float32Array(points);
+                const normals = new Float32Array(points * 3);
+                const bary = new Float32Array(points * 3);
+                const BARY = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+                const tilt = CONFIG.facetTilt;
+
+                const palette = [
+                    new THREE.Color(0x00ffff),   // cyan
+                    new THREE.Color(0xff00ff),   // magenta
+                    new THREE.Color(0xffff00)    // yellow
+                ];
+                const variation = 0.05;
+
+                let v = 0;
+                for (let b = 0; b < BIRDS; b++) {
+                    const ix = b % WIDTH;
+                    const iy = Math.floor(b / WIDTH);
+                    const u = (ix + 0.5) / WIDTH;
+                    const w = (iy + 0.5) / WIDTH;
+
+                    const c = palette[b % 3].clone();
+                    c.r = Math.min(1, Math.max(0, c.r + (Math.random() - 0.5) * variation));
+                    c.g = Math.min(1, Math.max(0, c.g + (Math.random() - 0.5) * variation));
+                    c.b = Math.min(1, Math.max(0, c.b + (Math.random() - 0.5) * variation));
+
+                    const size = 1 + (Math.random() - 0.5) * 2 * CONFIG.sizeVariation;
+
+                    for (const tri of tris) {
+                        // Every facet is a flat sheet: the body, wings and tail
+                        // lie in the xz plane, the keel in the yz plane. Tilt
+                        // each facet a little so they catch light differently.
+                        const isKeel = tri.includes('keelTop') || tri.includes('keelBot');
+                        const t1 = (Math.random() - 0.5) * 2 * tilt;
+                        const t2 = (Math.random() - 0.5) * 2 * tilt;
+                        const n = isKeel ? new THREE.Vector3(1, t1, t2) : new THREE.Vector3(t1, 1, t2);
+                        n.normalize();
+
+                        for (let k = 0; k < 3; k++) {
+                            const q = P[tri[k]];
+                            normals[v * 3 + 0] = n.x;
+                            normals[v * 3 + 1] = n.y;
+                            normals[v * 3 + 2] = n.z;
+                            bary[v * 3 + 0] = BARY[k][0];
+                            bary[v * 3 + 1] = BARY[k][1];
+                            bary[v * 3 + 2] = BARY[k][2];
+                            vertices[v * 3 + 0] = q[0];
+                            vertices[v * 3 + 1] = q[1];
+                            vertices[v * 3 + 2] = q[2];
+                            colors[v * 3 + 0] = c.r;
+                            colors[v * 3 + 1] = c.g;
+                            colors[v * 3 + 2] = c.b;
+                            references[v * 2 + 0] = u;
+                            references[v * 2 + 1] = w;
+                            joint[v] = q[3];
+                            inkWeight[v] = q[4];
+                            birdSize[v] = size;
+                            v++;
+                        }
+                    }
+                }
+
+                this.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+                this.setAttribute('birdColor', new THREE.BufferAttribute(colors, 3));
+                this.setAttribute('reference', new THREE.BufferAttribute(references, 2));
+                this.setAttribute('joint', new THREE.BufferAttribute(joint, 1));
+                this.setAttribute('inkWeight', new THREE.BufferAttribute(inkWeight, 1));
+                this.setAttribute('birdSize', new THREE.BufferAttribute(birdSize, 1));
+                this.setAttribute('birdNormal', new THREE.BufferAttribute(normals, 3));
+                this.setAttribute('bary', new THREE.BufferAttribute(bary, 3));
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Minimal GPGPU ping-pong helper
+        // ------------------------------------------------------------
+        class GPUCompute {
+            constructor(size, renderer, targetType) {
+                this.size = size;
+                this.renderer = renderer;
+                this.targetType = targetType;
+                this.variables = [];
+                this.current = 0;
+
+                this.scene = new THREE.Scene();
+                this.camera = new THREE.Camera();
+                this.camera.position.z = 1;
+
+                this.passThruUniforms = { passThruTexture: { value: null } };
+                this.passThru = new THREE.ShaderMaterial({
+                    uniforms: this.passThruUniforms,
+                    vertexShader: 'void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }',
+                    fragmentShader: `
+                        uniform sampler2D passThruTexture;
+                        void main() {
+                            vec2 uv = gl_FragCoord.xy / vec2(${size.toFixed(1)});
+                            gl_FragColor = texture2D(passThruTexture, uv);
+                        }`
+                });
+
+                this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.passThru);
+                this.scene.add(this.mesh);
+            }
+
+            createTexture() {
+                const data = new Float32Array(this.size * this.size * 4);
+                const tex = new THREE.DataTexture(data, this.size, this.size, THREE.RGBAFormat, THREE.FloatType);
+                tex.needsUpdate = true;
+                return tex;
+            }
+
+            addVariable(name, fragmentShader, uniforms, initialTexture) {
+                const header = `
+                    #define WIDTH ${this.size.toFixed(1)}
+                    uniform vec2 resolution;
+                    uniform sampler2D texturePosition;
+                    uniform sampler2D textureVelocity;
+                    uniform float time;
+                    uniform float delta;
+                ` + Object.keys(uniforms).map(k => {
+                    const val = uniforms[k].value;
+                    const type = val && val.isVector3 ? 'vec3' : 'float';
+                    return `uniform ${type} ${k};`;
+                }).join('\n');
+
+                const material = new THREE.ShaderMaterial({
+                    uniforms: Object.assign({
+                        resolution: { value: new THREE.Vector2(this.size, this.size) },
+                        texturePosition: { value: null },
+                        textureVelocity: { value: null },
+                        time: { value: 0 },
+                        delta: { value: 0 }
+                    }, uniforms),
+                    vertexShader: 'void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }',
+                    fragmentShader: header + '\n' + fragmentShader
+                });
+
+                const variable = { name, material, targets: [this.createTarget(), this.createTarget()] };
+                this.renderTexture(initialTexture, variable.targets[0]);
+                this.renderTexture(initialTexture, variable.targets[1]);
+                this.variables.push(variable);
+                return variable;
+            }
+
+            createTarget() {
+                return new THREE.WebGLRenderTarget(this.size, this.size, {
+                    wrapS: THREE.ClampToEdgeWrapping,
+                    wrapT: THREE.ClampToEdgeWrapping,
+                    minFilter: THREE.NearestFilter,
+                    magFilter: THREE.NearestFilter,
+                    format: THREE.RGBAFormat,
+                    type: this.targetType,
+                    depthBuffer: false,
+                    stencilBuffer: false
+                });
+            }
+
+            renderTexture(input, output) {
+                this.passThruUniforms.passThruTexture.value = input;
+                this.doRender(this.passThru, output);
+                this.passThruUniforms.passThruTexture.value = null;
+            }
+
+            doRender(material, output) {
+                const previous = this.renderer.getRenderTarget();
+                this.mesh.material = material;
+                this.renderer.setRenderTarget(output);
+                this.renderer.render(this.scene, this.camera);
+                this.mesh.material = this.passThru;
+                this.renderer.setRenderTarget(previous);
+            }
+
+            compute() {
+                const cur = this.current;
+                const next = 1 - cur;
+                for (const variable of this.variables) {
+                    for (const dep of this.variables) {
+                        variable.material.uniforms[dep.name].value = dep.targets[cur].texture;
+                    }
+                    this.doRender(variable.material, variable.targets[next]);
+                }
+                this.current = next;
+            }
+
+            texture(variable) {
+                return variable.targets[this.current].texture;
+            }
+        }
+
+        // Float render targets are not universal; fall back to half float.
+        function pickTargetType(renderer) {
+            const gl = renderer.getContext();
+            if (renderer.capabilities.isWebGL2) {
+                if (gl.getExtension('EXT_color_buffer_float')) return THREE.FloatType;
+                if (gl.getExtension('EXT_color_buffer_half_float')) return THREE.HalfFloatType;
+                return THREE.FloatType;
+            }
+            const hasFloat = gl.getExtension('OES_texture_float');
+            if (hasFloat && gl.getExtension('WEBGL_color_buffer_float')) return THREE.FloatType;
+            if (gl.getExtension('OES_texture_half_float') && gl.getExtension('EXT_color_buffer_half_float')) return THREE.HalfFloatType;
+            return hasFloat ? THREE.FloatType : THREE.HalfFloatType;
+        }
+
+        // ------------------------------------------------------------
+        // Scene
+        // ------------------------------------------------------------
+        let container, camera, scene, renderer;
+        let gpu, positionVariable, velocityVariable, positionUniforms, velocityUniforms, birdUniforms;
+
+        const viewDir = new THREE.Vector3(0, 0, -1);
+
+        const home = {
+            radius: new THREE.Vector3(200, 150, CONFIG.homeDepth),
+            center: new THREE.Vector3()
+        };
+
+        const pointer = {
+            ndc: new THREE.Vector2(0, 0),
+            world: new THREE.Vector3(1e5, 1e5, 0),
+            eased: new THREE.Vector3(1e5, 1e5, 0),
+            active: false,
+            lastMove: -Infinity,
+            strength: 0,
+            burst: 0
+        };
+
+        let last = performance.now();
+        let simTime = 0;
+
+        function init() {
+            container = document.getElementById('birds-background');
+
+            camera = new THREE.PerspectiveCamera(CONFIG.cameraFov, window.innerWidth / window.innerHeight, 1, 3000);
+            placeCamera(0);
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xFFFEFA);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.maxPixelRatio));
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            container.appendChild(renderer.domElement);
+
+            updateHome();
+            initCompute();
+            initBirds();
+
+            container.style.touchAction = 'none';
+            document.addEventListener('pointermove', onPointerMove);
+            document.addEventListener('pointerdown', onPointerDown);
+            document.addEventListener('touchmove', onTouchMove, { passive: false });
+            document.documentElement.addEventListener('mouseleave', () => { pointer.active = false; });
+            document.addEventListener('visibilitychange', () => { last = performance.now(); });
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function initCompute() {
+            gpu = new GPUCompute(WIDTH, renderer, pickTargetType(renderer));
+
+            const dtPosition = gpu.createTexture();
+            const dtVelocity = gpu.createTexture();
+            fillPositionTexture(dtPosition);
+            fillVelocityTexture(dtVelocity);
+
+            const fovCos = Math.cos((CONFIG.fieldOfView / 2) * Math.PI / 180);
+
+            velocityVariable = gpu.addVariable('textureVelocity',
+                document.getElementById('fragmentShaderVelocity').textContent, {
+                    cruiseSpeed: { value: CONFIG.cruiseSpeed },
+                    minSpeed: { value: CONFIG.minSpeed },
+                    maxSpeed: { value: CONFIG.maxSpeed },
+                    maxForce: { value: CONFIG.maxForce },
+                    separationDistance: { value: CONFIG.separationDistance },
+                    alignmentDistance: { value: CONFIG.alignmentDistance },
+                    cohesionDistance: { value: CONFIG.cohesionDistance },
+                    separationWeight: { value: CONFIG.separationWeight },
+                    alignmentWeight: { value: CONFIG.alignmentWeight },
+                    cohesionWeight: { value: CONFIG.cohesionWeight },
+                    fovCos: { value: fovCos },
+                    colorAffinity: { value: CONFIG.colorAffinity },
+                    homeCenter: { value: home.center },
+                    homeRadius: { value: home.radius },
+                    homeStrength: { value: CONFIG.homeStrength },
+                    homePull: { value: CONFIG.homePull },
+                    predator: { value: pointer.eased },
+                    viewDir: { value: viewDir },
+                    predatorRadius: { value: CONFIG.predatorRadius },
+                    predatorStrength: { value: 0 },
+                    predatorForce: { value: CONFIG.predatorForce },
+                    wanderStrength: { value: CONFIG.wanderStrength },
+                    bankGain: { value: CONFIG.bankGain },
+                    maxBank: { value: CONFIG.maxBank },
+                    bankRate: { value: CONFIG.bankRate }
+                }, dtVelocity);
+
+            positionVariable = gpu.addVariable('texturePosition',
+                document.getElementById('fragmentShaderPosition').textContent, {
+                    flapBase: { value: CONFIG.flapBase },
+                    flapPerSpeed: { value: CONFIG.flapPerSpeed },
+                    flapPerClimb: { value: CONFIG.flapPerClimb }
+                }, dtPosition);
+
+            positionUniforms = positionVariable.material.uniforms;
+            velocityUniforms = velocityVariable.material.uniforms;
+        }
+
+        function initBirds() {
+            birdUniforms = {
+                texturePosition: { value: null },
+                textureVelocity: { value: null },
+                birdScale: { value: CONFIG.birdScale },
+                density: { value: CONFIG.glassDensity },
+                rimWidth: { value: CONFIG.rimWidth },
+                rimStrength: { value: CONFIG.rimStrength },
+                glintStrength: { value: CONFIG.glintStrength },
+                fresnelStrength: { value: CONFIG.fresnelStrength },
+                lightDir: { value: new THREE.Vector3().fromArray(CONFIG.lightDir) },
+                fogNear: { value: CONFIG.fogNear },
+                fogFar: { value: CONFIG.fogFar },
+                fogAmount: { value: CONFIG.fogAmount }
+            };
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: birdUniforms,
+                vertexShader: document.getElementById('birdVS').textContent,
+                fragmentShader: document.getElementById('birdFS').textContent,
+                side: THREE.DoubleSide,
+                transparent: true,
+                blending: THREE.MultiplyBlending,
+                depthWrite: false
+            });
+
+            const mesh = new THREE.Mesh(new BirdGeometry(), material);
+            mesh.frustumCulled = false;
+            scene.add(mesh);
+        }
+
+        // Birds start scattered through the home ellipsoid, already on the
+        // wing at a sensible airspeed.
+        function fillPositionTexture(texture) {
+            const a = texture.image.data;
+            for (let k = 0; k < a.length; k += 4) {
+                let x, y, z;
+                do {
+                    x = Math.random() * 2 - 1;
+                    y = Math.random() * 2 - 1;
+                    z = Math.random() * 2 - 1;
+                } while (x * x + y * y + z * z > 1);
+                a[k + 0] = x * home.radius.x;
+                a[k + 1] = y * home.radius.y;
+                a[k + 2] = z * home.radius.z;
+                a[k + 3] = Math.random() * Math.PI * 2;
+            }
+        }
+
+        function fillVelocityTexture(texture) {
+            const a = texture.image.data;
+            for (let k = 0; k < a.length; k += 4) {
+                const v = new THREE.Vector3(Math.random() - 0.5, (Math.random() - 0.5) * 0.4, Math.random() - 0.5);
+                v.normalize().multiplyScalar(CONFIG.cruiseSpeed * (0.8 + Math.random() * 0.4));
+                a[k + 0] = v.x;
+                a[k + 1] = v.y;
+                a[k + 2] = v.z;
+                a[k + 3] = 0;
+            }
+        }
+
+        // The home ellipsoid is sized from what the camera can see at the
+        // flock's centre, so the flock stays in frame at any aspect ratio.
+        // Because the camera looks down at an angle, the flock's depth
+        // also shows on screen as height, and the height allowance
+        // shrinks to make room for it.
+        function updateHome() {
+            const e = CONFIG.cameraElevation * Math.PI / 180;
+            const halfH = CONFIG.cameraDistance * Math.tan(CONFIG.cameraFov / 2 * Math.PI / 180);
+            const halfW = halfH * camera.aspect;
+            const depth = CONFIG.homeDepth;
+            const height = Math.max(60, (halfH * CONFIG.homeMargin - depth * Math.sin(e)) / Math.cos(e));
+            home.radius.set(halfW * CONFIG.homeMargin, height, depth);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            updateHome();
+        }
+
+        function setPointer(clientX, clientY) {
+            pointer.ndc.set((clientX / window.innerWidth) * 2 - 1, -(clientY / window.innerHeight) * 2 + 1);
+            pointer.active = true;
+            pointer.lastMove = performance.now();
+        }
+
+        function onPointerMove(event) {
+            if (event.isPrimary === false) return;
+            setPointer(event.clientX, event.clientY);
+        }
+
+        function onPointerDown(event) {
+            if (event.isPrimary === false) return;
+            setPointer(event.clientX, event.clientY);
+            pointer.burst = 1;
+        }
+
+        function onTouchMove(event) {
+            if (event.touches.length === 1) {
+                event.preventDefault();
+                setPointer(event.touches[0].clientX, event.touches[0].clientY);
+            }
+        }
+
+        // The camera sits a little above the flock, looking down at its
+        // centre, with a slow sway so the depth of the flock shows.
+        function placeCamera(t) {
+            const e = CONFIG.cameraElevation * Math.PI / 180;
+            const d = CONFIG.cameraDistance;
+            const drift = CONFIG.cameraDrift;
+            camera.position.set(
+                Math.sin(t * 0.05) * drift,
+                d * Math.sin(e) + Math.sin(t * 0.037 + 0.7) * drift * 0.6,
+                d * Math.cos(e)
+            );
+            camera.lookAt(0, 0, 0);
+            viewDir.copy(camera.position).negate().normalize();
+        }
+
+        // Project the pointer onto the plane through the flock's centre
+        // that faces the camera.
+        const rayPoint = new THREE.Vector3();
+        function pointerToWorld(out) {
+            rayPoint.set(pointer.ndc.x, pointer.ndc.y, 0.5).unproject(camera);
+            rayPoint.sub(camera.position).normalize();
+            const t = -camera.position.dot(viewDir) / rayPoint.dot(viewDir);
+            out.copy(camera.position).addScaledVector(rayPoint, t);
+        }
+
+        function updatePredator(now, dt) {
+            const idle = (now - pointer.lastMove) / 1000 > CONFIG.predatorLinger;
+            const target = pointer.active && !idle ? 1 : 0;
+            pointer.strength += (target - pointer.strength) * (1 - Math.exp(-dt * 6));
+            pointer.burst *= Math.exp(-dt * 2.2);
+
+            if (target > 0 || pointer.strength > 0.01 || pointer.burst > 0.01) {
+                pointerToWorld(pointer.world);
+                // First contact snaps; afterwards the predator glides after the pointer.
+                if (pointer.eased.x > 1e4) pointer.eased.copy(pointer.world);
+                else pointer.eased.lerp(pointer.world, 1 - Math.exp(-dt * 14));
+            } else {
+                pointer.eased.set(1e5, 1e5, 0);
+            }
+
+            velocityUniforms.predatorStrength.value = pointer.strength + pointer.burst * CONFIG.burstStrength;
+            velocityUniforms.predatorRadius.value = CONFIG.predatorRadius * (1 + 0.8 * pointer.burst);
+        }
+
+        function updateDrift(t) {
+            const r = home.radius;
+            const d = CONFIG.homeDrift;
+            home.center.set(
+                Math.sin(t * 0.021) * r.x * d,
+                Math.sin(t * 0.017 + 1.3) * r.y * d,
+                Math.sin(t * 0.011 + 2.1) * r.z * d * 0.5
+            );
+
+            const breath = Math.sin(t * Math.PI * 2 / CONFIG.affinityPeriod);
+            velocityUniforms.colorAffinity.value = Math.min(0.95, Math.max(0,
+                CONFIG.colorAffinity + CONFIG.affinityBreath * breath));
+
+            if (CONFIG.cameraDrift > 0) placeCamera(t);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            render();
+        }
+
+        function render() {
+            const now = performance.now();
+            const rawDt = Math.min((now - last) / 1000, 1 / 30);
+            last = now;
+
+            const dt = rawDt * CONFIG.timeScale;
+            simTime += dt;
+
+            updatePredator(now, rawDt);
+            updateDrift(simTime);
+
+            positionUniforms.time.value = simTime;
+            positionUniforms.delta.value = dt;
+            velocityUniforms.time.value = simTime;
+            velocityUniforms.delta.value = dt;
+
+            gpu.compute();
+
+            birdUniforms.texturePosition.value = gpu.texture(positionVariable);
+            birdUniforms.textureVelocity.value = gpu.texture(velocityVariable);
+
+            renderer.render(scene, camera);
+        }
+
+        try {
+            init();
+            animate();
+        } catch (err) {
+            console.error('CMY birds could not start:', err);
+        }
+    })();
+    </script>
+</body>
+</html>

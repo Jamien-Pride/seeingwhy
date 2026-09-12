@@ -13,3 +13,11 @@ Tune it by editing `CONFIG` in the file, or from the URL:
     birds.html?birds=64        flock is birds x birds (default 40 desktop, 32 mobile)
     birds.html?speed=0.7       time scale
     birds.html?affinity=0.6    how strongly each colour keeps to itself (0 - 0.95)
+
+## birds-glass.html
+
+The same flock rendered as faceted coloured glass on a light table: light
+is absorbed in proportion to how much glass it crosses, facets tilt against
+each other and catch glints as the wings beat, and each facet has a
+bevelled edge. Same tuning parameters, plus a glass block in `CONFIG`
+(density, facet tilt, bevel, glint, light direction).
