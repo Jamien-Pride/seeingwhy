@@ -95,6 +95,10 @@
         stall or snap, and the lateral acceleration of each bird is
         turned into a banking angle so they roll into their turns.
 
+        Each bird is a small articulated model: a spindle body with a
+        thin keel, a forked tail and two-segment wings that beat at the
+        shoulder and wrist, with the ink thinning toward the feather tips.
+
         Tuning: edit CONFIG below, or override a few things from the
         URL, e.g.  birds.html?birds=64&speed=0.8&affinity=0.6
         ============================================================
@@ -233,10 +237,10 @@
             float homeF = homePull + homeStrength * over * over;
             acc -= relN * maxForce * min( homeF, 3.0 );
 
-            // Predator (the pointer). Distance is measured mostly in the
-            // screen plane so the whole depth of the flock reacts.
+            // Predator (the pointer). Distance is measured mostly across the
+            // screen so the whole depth of the flock reacts.
             vec3 pd = pos - predator;
-            pd.z *= 0.35;
+            pd -= viewDir * dot( pd, viewDir ) * 0.65;
             float pdist = length( pd );
             float scare = 0.0;
             if ( predatorStrength > 0.001 && pdist < predatorRadius ) {
@@ -286,15 +290,29 @@
     <!-- Bird rendering -->
     <script type="x-shader/x-vertex" id="birdVS">
         attribute vec2 reference;
-        attribute float wingTip;
+        attribute float joint;       // 0 body/tail, 1 inner wing, 2 outer wing
+        attribute float inkWeight;   // ink density, thinning toward feather tips
+        attribute float birdSize;    // per-bird size multiplier
         attribute vec3 birdColor;
 
         uniform sampler2D texturePosition;
         uniform sampler2D textureVelocity;
-        uniform float flapAmplitude;
+        uniform float birdScale;
 
         varying vec3 vColor;
         varying float vDepth;
+        varying float vInk;
+
+        // Wing joints in local (unscaled) bird units.
+        const float SHOULDER = 2.6;
+        const float WRIST = 12.0;
+
+        vec2 rotateAbout( vec2 p, float pivotX, float a ) {
+            vec2 q = p - vec2( pivotX, 0.0 );
+            float c = cos( a );
+            float s = sin( a );
+            return vec2( q.x * c - q.y * s, q.x * s + q.y * c ) + vec2( pivotX, 0.0 );
+        }
 
         void main() {
             vec4 p = texture2D( texturePosition, reference );
@@ -317,20 +335,34 @@
             vec3 rB = right * cb + up * sb;
             vec3 uB = up * cb - right * sb;
 
-            // Wing beat: the tips rise and fall, and fold in a little on
-            // the up-stroke.
+            // Wing beat. The stroke is asymmetric (a quick downstroke, a
+            // slower recovery), the outer wing lags the inner wing and
+            // folds back a little on the way up, and a diving bird
+            // settles into a glide with its wings held in a shallow V.
+            float glide = smoothstep( -40.0, 0.0, vel.y );
+            float beat = mix( 0.2, 1.0, glide );
+            float phi = p.w;
+            phi += 0.35 * sin( phi );
+            float shoulder = 0.12 + 0.55 * beat * cos( phi );
+            float wrist = 0.7 * beat * cos( phi - 0.8 ) - 0.08;
+
             vec3 local = position;
-            if ( wingTip > 0.5 ) {
-                float flap = sin( p.w );
-                local.y += flap * flapAmplitude;
-                local.x *= 1.0 - 0.18 * max( flap, 0.0 );
+            if ( joint > 0.5 ) {
+                float side = local.x < 0.0 ? -1.0 : 1.0;
+                if ( joint > 1.5 ) {
+                    local.xy = rotateAbout( local.xy, WRIST * side, wrist * side );
+                    local.z -= 3.5 * max( 0.0, -cos( phi ) ) * beat;
+                }
+                local.xy = rotateAbout( local.xy, SHOULDER * side, shoulder * side );
             }
+            local *= birdScale * birdSize;
 
             vec3 world = mat3( rB, uB, forward ) * local + p.xyz;
             vec4 mv = viewMatrix * vec4( world, 1.0 );
 
             vDepth = -mv.z;
             vColor = birdColor;
+            vInk = inkWeight;
             gl_Position = projectionMatrix * mv;
         }
     </script>
@@ -338,6 +370,7 @@
     <script type="x-shader/x-fragment" id="birdFS">
         varying vec3 vColor;
         varying float vDepth;
+        varying float vInk;
 
         uniform float ink;
         uniform float fogNear;
@@ -345,10 +378,11 @@
         uniform float fogAmount;
 
         void main() {
-            // Distant birds carry less ink. Under multiply blending white
-            // is transparent, so fading toward white fades the bird out.
+            // Distant birds carry less ink, and the ink thins toward the
+            // feather tips. Under multiply blending white is transparent,
+            // so fading toward white fades the bird out.
             float fade = 1.0 - smoothstep( fogNear, fogFar, vDepth ) * fogAmount;
-            vec3 c = mix( vec3( 1.0 ), vColor, ink * fade );
+            vec3 c = mix( vec3( 1.0 ), vColor, ink * fade * vInk );
             gl_FragColor = vec4( c, 1.0 );
         }
     </script>
@@ -374,7 +408,8 @@
             // Flock size is textureWidth squared (40 -> 1600 birds).
             // The neighbour search is O(n^2), so keep it modest on phones.
             textureWidth: Math.round(Math.min(96, Math.max(8, num('birds', isMobile ? 32 : 40)))),
-            birdScale: 0.2,
+            birdScale: 0.24,           // world units per local bird unit (wingspan 50 local)
+            sizeVariation: 0.18,       // +/- fraction of size between individual birds
 
             // Airspeed (world units per second) and steering authority.
             cruiseSpeed: 95,
@@ -399,9 +434,9 @@
             affinityPeriod: 140,
 
             // Home ellipsoid: sized from the visible frame, drifting slowly.
-            homeMargin: 0.62,          // fraction of the visible half-width/height
+            homeMargin: 0.6,          // fraction of the visible half-width/height
             homeDepth: 120,            // half-depth in world units
-            homeStrength: 1.6,
+            homeStrength: 3.0,
             homePull: 0.04,
             homeDrift: 0.25,           // fraction of the radius the centre wanders
 
@@ -428,6 +463,7 @@
             fogAmount: 0.55,
             cameraDistance: 350,
             cameraFov: 75,
+            cameraElevation: 18,       // degrees above the flock, so wings read from above
             cameraDrift: reduceMotion ? 0 : 16,
 
             timeScale: num('speed', 1) * (reduceMotion ? 0.5 : 1),
@@ -438,34 +474,65 @@
         const BIRDS = WIDTH * WIDTH;
 
         // ------------------------------------------------------------
-        // Bird geometry: four triangles per bird - a vertical fin, a flat
-        // body and two swept wings. Non-overlapping so multiply blending
-        // does not double up inside a single bird.
+        // Bird geometry. Local frame: +x right wing, +y up, +z forward.
+        // A flat spindle body with a thin vertical keel so it reads from
+        // every angle, a forked tail, and two-segment wings (arm and hand)
+        // that the vertex shader articulates at the shoulder and wrist.
+        // Pieces meet edge to edge rather than overlapping, so multiply
+        // blending does not double up inside one bird.
         // ------------------------------------------------------------
         class BirdGeometry extends THREE.BufferGeometry {
             constructor() {
                 super();
 
-                const trianglesPerBird = 4;
-                const vertsPerBird = trianglesPerBird * 3;
+                // Named points: [x, y, z, joint, ink]
+                const P = {
+                    nose:   [0, 0, 28, 0, 1.0],
+                    core:   [0, 0, 6, 0, 1.0],
+                    tailRt: [0, 0, -12, 0, 0.9],
+                    L1: [-2.2, 0, 16, 0, 1.0],  R1: [2.2, 0, 16, 0, 1.0],
+                    L2: [-3.2, 0, 4, 0, 1.0],   R2: [3.2, 0, 4, 0, 1.0],
+                    L3: [-2.0, 0, -8, 0, 0.95], R3: [2.0, 0, -8, 0, 0.95],
+                    keelTop: [0, 2.4, 8, 0, 1.0],
+                    keelBot: [0, -1.6, 5, 0, 1.0],
+                    tailL:  [-4.5, 0, -24, 0, 0.55],
+                    tailR:  [4.5, 0, -24, 0, 0.55],
+                    notch:  [0, 0, -19, 0, 0.8],
+                    // left wing
+                    lRL: [-2.6, 0, 10, 1, 1.0],  lRT: [-2.6, 0, -4, 1, 1.0],
+                    lWL: [-12, 0, 9, 1, 0.85],   lWT: [-12, 0, -2, 1, 0.85],
+                    lTL: [-21, 0, 3, 2, 0.6],    lTip: [-25, 0, -7, 2, 0.4],
+                    // right wing
+                    rRL: [2.6, 0, 10, 1, 1.0],   rRT: [2.6, 0, -4, 1, 1.0],
+                    rWL: [12, 0, 9, 1, 0.85],    rWT: [12, 0, -2, 1, 0.85],
+                    rTL: [21, 0, 3, 2, 0.6],     rTip: [25, 0, -7, 2, 0.4]
+                };
+
+                const tris = [
+                    // body fan
+                    ['nose', 'L1', 'core'], ['L1', 'L2', 'core'], ['L2', 'L3', 'core'], ['L3', 'tailRt', 'core'],
+                    ['nose', 'core', 'R1'], ['R1', 'core', 'R2'], ['R2', 'core', 'R3'], ['R3', 'core', 'tailRt'],
+                    // keel
+                    ['nose', 'keelTop', 'tailRt'], ['nose', 'tailRt', 'keelBot'],
+                    // forked tail
+                    ['tailRt', 'tailL', 'notch'], ['tailRt', 'notch', 'tailR'],
+                    // left wing: arm then hand
+                    ['lRL', 'lWL', 'lRT'], ['lWL', 'lWT', 'lRT'],
+                    ['lWL', 'lTL', 'lWT'], ['lTL', 'lTip', 'lWT'],
+                    // right wing
+                    ['rRL', 'rRT', 'rWL'], ['rWL', 'rRT', 'rWT'],
+                    ['rWL', 'rWT', 'rTL'], ['rTL', 'rWT', 'rTip']
+                ];
+
+                const vertsPerBird = tris.length * 3;
                 const points = BIRDS * vertsPerBird;
 
                 const vertices = new Float32Array(points * 3);
                 const colors = new Float32Array(points * 3);
                 const references = new Float32Array(points * 2);
-                const wingTip = new Float32Array(points);
-
-                // Local frame: +x right wing, +y up, +z forward (nose).
-                const shape = [
-                    // fin
-                    [0, 0, -20, 0], [0, 3.5, -20, 0], [0, 0, 30, 0],
-                    // flat body
-                    [-2.2, 0, -20, 0], [2.2, 0, -20, 0], [0, 0, 30, 0],
-                    // left wing (tip flagged)
-                    [-1.5, 0, -11, 0], [-20, 0, -4, 1], [-1.5, 0, 13, 0],
-                    // right wing (tip flagged)
-                    [1.5, 0, 13, 0], [20, 0, -4, 1], [1.5, 0, -11, 0]
-                ];
+                const joint = new Float32Array(points);
+                const inkWeight = new Float32Array(points);
+                const birdSize = new Float32Array(points);
 
                 const palette = [
                     new THREE.Color(0x00ffff),   // cyan
@@ -486,24 +553,33 @@
                     c.g = Math.min(1, Math.max(0, c.g + (Math.random() - 0.5) * variation));
                     c.b = Math.min(1, Math.max(0, c.b + (Math.random() - 0.5) * variation));
 
-                    for (let k = 0; k < vertsPerBird; k++, v++) {
-                        const s = shape[k];
-                        vertices[v * 3 + 0] = s[0] * CONFIG.birdScale;
-                        vertices[v * 3 + 1] = s[1] * CONFIG.birdScale;
-                        vertices[v * 3 + 2] = s[2] * CONFIG.birdScale;
-                        colors[v * 3 + 0] = c.r;
-                        colors[v * 3 + 1] = c.g;
-                        colors[v * 3 + 2] = c.b;
-                        references[v * 2 + 0] = u;
-                        references[v * 2 + 1] = w;
-                        wingTip[v] = s[3];
+                    const size = 1 + (Math.random() - 0.5) * 2 * CONFIG.sizeVariation;
+
+                    for (const tri of tris) {
+                        for (const name of tri) {
+                            const q = P[name];
+                            vertices[v * 3 + 0] = q[0];
+                            vertices[v * 3 + 1] = q[1];
+                            vertices[v * 3 + 2] = q[2];
+                            colors[v * 3 + 0] = c.r;
+                            colors[v * 3 + 1] = c.g;
+                            colors[v * 3 + 2] = c.b;
+                            references[v * 2 + 0] = u;
+                            references[v * 2 + 1] = w;
+                            joint[v] = q[3];
+                            inkWeight[v] = q[4];
+                            birdSize[v] = size;
+                            v++;
+                        }
                     }
                 }
 
                 this.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
                 this.setAttribute('birdColor', new THREE.BufferAttribute(colors, 3));
                 this.setAttribute('reference', new THREE.BufferAttribute(references, 2));
-                this.setAttribute('wingTip', new THREE.BufferAttribute(wingTip, 1));
+                this.setAttribute('joint', new THREE.BufferAttribute(joint, 1));
+                this.setAttribute('inkWeight', new THREE.BufferAttribute(inkWeight, 1));
+                this.setAttribute('birdSize', new THREE.BufferAttribute(birdSize, 1));
             }
         }
 
@@ -643,6 +719,8 @@
         let container, camera, scene, renderer;
         let gpu, positionVariable, velocityVariable, positionUniforms, velocityUniforms, birdUniforms;
 
+        const viewDir = new THREE.Vector3(0, 0, -1);
+
         const home = {
             radius: new THREE.Vector3(200, 150, CONFIG.homeDepth),
             center: new THREE.Vector3()
@@ -665,8 +743,7 @@
             container = document.getElementById('birds-background');
 
             camera = new THREE.PerspectiveCamera(CONFIG.cameraFov, window.innerWidth / window.innerHeight, 1, 3000);
-            camera.position.z = CONFIG.cameraDistance;
-            camera.lookAt(0, 0, 0);
+            placeCamera(0);
 
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0xFFFEFA);
@@ -718,6 +795,7 @@
                     homeStrength: { value: CONFIG.homeStrength },
                     homePull: { value: CONFIG.homePull },
                     predator: { value: pointer.eased },
+                    viewDir: { value: viewDir },
                     predatorRadius: { value: CONFIG.predatorRadius },
                     predatorStrength: { value: 0 },
                     predatorForce: { value: CONFIG.predatorForce },
@@ -742,7 +820,7 @@
             birdUniforms = {
                 texturePosition: { value: null },
                 textureVelocity: { value: null },
-                flapAmplitude: { value: 20 * CONFIG.birdScale * 0.9 },
+                birdScale: { value: CONFIG.birdScale },
                 ink: { value: CONFIG.ink },
                 fogNear: { value: CONFIG.fogNear },
                 fogFar: { value: CONFIG.fogFar },
@@ -794,12 +872,18 @@
             }
         }
 
-        // The home ellipsoid is sized from what the camera can see at z = 0,
-        // so the flock stays in frame at any aspect ratio.
+        // The home ellipsoid is sized from what the camera can see at the
+        // flock's centre, so the flock stays in frame at any aspect ratio.
+        // Because the camera looks down at an angle, the flock's depth
+        // also shows on screen as height, and the height allowance
+        // shrinks to make room for it.
         function updateHome() {
+            const e = CONFIG.cameraElevation * Math.PI / 180;
             const halfH = CONFIG.cameraDistance * Math.tan(CONFIG.cameraFov / 2 * Math.PI / 180);
             const halfW = halfH * camera.aspect;
-            home.radius.set(halfW * CONFIG.homeMargin, halfH * CONFIG.homeMargin, CONFIG.homeDepth);
+            const depth = CONFIG.homeDepth;
+            const height = Math.max(60, (halfH * CONFIG.homeMargin - depth * Math.sin(e)) / Math.cos(e));
+            home.radius.set(halfW * CONFIG.homeMargin, height, depth);
         }
 
         function onWindowResize() {
@@ -833,12 +917,28 @@
             }
         }
 
-        // Project the pointer onto the z = 0 plane through the flock.
+        // The camera sits a little above the flock, looking down at its
+        // centre, with a slow sway so the depth of the flock shows.
+        function placeCamera(t) {
+            const e = CONFIG.cameraElevation * Math.PI / 180;
+            const d = CONFIG.cameraDistance;
+            const drift = CONFIG.cameraDrift;
+            camera.position.set(
+                Math.sin(t * 0.05) * drift,
+                d * Math.sin(e) + Math.sin(t * 0.037 + 0.7) * drift * 0.6,
+                d * Math.cos(e)
+            );
+            camera.lookAt(0, 0, 0);
+            viewDir.copy(camera.position).negate().normalize();
+        }
+
+        // Project the pointer onto the plane through the flock's centre
+        // that faces the camera.
         const rayPoint = new THREE.Vector3();
         function pointerToWorld(out) {
             rayPoint.set(pointer.ndc.x, pointer.ndc.y, 0.5).unproject(camera);
             rayPoint.sub(camera.position).normalize();
-            const t = -camera.position.z / rayPoint.z;
+            const t = -camera.position.dot(viewDir) / rayPoint.dot(viewDir);
             out.copy(camera.position).addScaledVector(rayPoint, t);
         }
 
@@ -874,14 +974,7 @@
             velocityUniforms.colorAffinity.value = Math.min(0.95, Math.max(0,
                 CONFIG.colorAffinity + CONFIG.affinityBreath * breath));
 
-            if (CONFIG.cameraDrift > 0) {
-                camera.position.set(
-                    Math.sin(t * 0.05) * CONFIG.cameraDrift,
-                    Math.sin(t * 0.037 + 0.7) * CONFIG.cameraDrift * 0.6,
-                    CONFIG.cameraDistance
-                );
-                camera.lookAt(0, 0, 0);
-            }
+            if (CONFIG.cameraDrift > 0) placeCamera(t);
         }
 
         function animate() {
